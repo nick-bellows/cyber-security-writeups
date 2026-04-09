@@ -1,0 +1,220 @@
+# Active Directory Basics
+
+**Platform:** TryHackMe  
+**Room:** [Active Directory Basics](https://tryhackme.com/room/winadbasics)  
+**Difficulty:** Easy  
+**Type:** ⚑ Walkthru
+**Status:** ✅ Completed  
+---
+
+## Executive Summary
+
+This room is foundational theory for anyone approaching Active Directory exploitation. Before attacking AD, you need to understand what you're attacking — the structure of domains, how authentication works, what BloodHound is actually mapping when it shows attack paths, and why certain accounts and groups are inherently dangerous. Active Directory is 40 points on the OSCP exam and all-or-nothing, making this conceptual groundwork critical.
+
+The room covers AD architecture, object types, Group Policy, Kerberos authentication, and trust relationships — the building blocks that every subsequent AD attack (Kerberoasting, AS-REP Roasting, Pass-the-Hash, DCSync) depends on.
+
+**Key concepts covered:**
+- Domain architecture — objects, OUs, trees, forests
+- Users, groups, and machine accounts
+- Group Policy Objects (GPOs) and their attack surface
+- Kerberos authentication flow (TGT/TGS)
+- NTLM authentication and its weaknesses
+- Domain trust relationships
+
+**Verdict:** Required reading before touching any AD attack tooling. Understanding why attacks work makes them stick.
+
+---
+
+## Active Directory Architecture
+
+### What Active Directory Is
+
+Active Directory Domain Services (AD DS) is Microsoft's centralized identity and access management system. It provides a single point of authentication and authorization for all resources in an organization — users, computers, printers, file shares, applications.
+
+From an attacker's perspective: **compromise AD = compromise everything it manages.**
+
+### Core Components
+
+**Domain Controller (DC):** The server running AD DS. Stores the AD database (NTDS.dit), handles all authentication, and enforces Group Policy. The primary target in any AD attack — owning the DC means owning the domain.
+
+**NTDS.dit:** The Active Directory database file. Contains all domain objects including user credentials (NT hashes). Located at `C:\Windows\NTDS\ntds.dit`. Extracting this file is a post-exploitation goal on domain controller compromise.
+
+**Domain:** A logical grouping of AD objects (users, computers, groups) that share the same AD database and are governed by the same policies. Example: `corp.local`
+
+**Organizational Units (OUs):** Containers within a domain used to organize objects and apply Group Policy selectively. Structure often mirrors the organization's departments (IT, Finance, HR). OUs are important during enumeration — they reveal organizational structure and help identify high-value targets.
+
+**Tree:** Multiple domains that share a common namespace. Example: `corp.local` (parent) + `eu.corp.local` (child).
+
+**Forest:** The top-level container — a collection of domain trees that share a schema and global catalog. Forest boundaries are the hardest trust boundary in AD.
+
+---
+
+## AD Object Types
+
+| Object Type | Description | Attacker Interest |
+|-------------|-------------|-------------------|
+| User accounts | Human or service accounts | Credential targets, delegation abuse |
+| Computer accounts | Domain-joined machines | Lateral movement targets |
+| Groups | Collections of users/computers | High-privilege groups are primary targets |
+| Service accounts | Non-human accounts running services | Kerberoasting targets (have SPNs) |
+| GPOs | Policy objects linked to OUs | Misconfigured write access = domain compromise |
+
+### High-Value Groups
+
+These groups represent the most critical targets during AD enumeration:
+
+| Group | Privilege Level |
+|-------|----------------|
+| Domain Admins | Full control over the domain |
+| Enterprise Admins | Full control over the entire forest |
+| Schema Admins | Can modify the AD schema |
+| Backup Operators | Can read NTDS.dit — effective domain compromise |
+| Server Operators | Can run commands on DCs |
+| Account Operators | Can create/modify most user accounts |
+
+---
+
+## Group Policy Objects (GPOs)
+
+GPOs allow administrators to enforce settings across all machines and users in an OU — password policies, software installation, login scripts, registry settings, firewall rules.
+
+**Attacker relevance:** If you gain write access to a GPO linked to an OU containing privileged users or computers, you can push arbitrary commands to every machine in that OU as SYSTEM. This is an immediate domain compromise vector.
+
+```bash
+# Enumerate GPOs during AD enumeration
+Get-GPO -All                           # PowerShell (on domain machine)
+bloodhound-python -c GPOs             # BloodHound collection
+```
+
+---
+
+## Authentication Protocols
+
+### Kerberos (Default in Modern AD)
+
+Kerberos is the primary authentication protocol in Active Directory environments. Understanding the flow explains why Kerberoasting and AS-REP Roasting work.
+
+**The flow:**
+
+```
+1. Client → KDC (AS-REQ): "I want to authenticate, here is my username"
+2. KDC → Client (AS-REP): "Here is your Ticket Granting Ticket (TGT)"
+                           encrypted with the user's password hash
+3. Client → KDC (TGS-REQ): "I want to access Service X, here is my TGT"
+4. KDC → Client (TGS-REP): "Here is a Service Ticket for Service X"
+                            encrypted with the SERVICE ACCOUNT's password hash
+5. Client → Service: "Here is my Service Ticket"
+6. Service → Client: "Access granted"
+```
+
+**Why this matters for attacks:**
+
+- **AS-REP Roasting:** Targets accounts with "Do not require Kerberos preauthentication" enabled. The KDC returns an AS-REP encrypted with the user's hash without verifying identity first — the encrypted response can be cracked offline.
+
+- **Kerberoasting:** Any authenticated domain user can request a Service Ticket for any SPN. The ticket is encrypted with the service account's hash. Request it, take it offline, crack it. Service accounts often have weak passwords and high privileges.
+
+**Key Kerberos terms:**
+
+| Term | Meaning |
+|------|---------|
+| KDC | Key Distribution Center — runs on the DC, issues tickets |
+| TGT | Ticket Granting Ticket — proves identity to KDC |
+| TGS | Ticket Granting Service ticket — grants access to a specific service |
+| SPN | Service Principal Name — identifies a service (Kerberoasting target) |
+| AS-REQ/AS-REP | Authentication Service request/response |
+
+### NTLM (Legacy — Still Common)
+
+NTLM is the older authentication protocol, still used in many scenarios (accessing resources by IP instead of hostname, older systems, certain configurations).
+
+**NTLM flow:**
+1. Client sends username
+2. Server sends a random challenge
+3. Client encrypts the challenge with their NT hash and sends it back
+4. Server verifies by performing the same operation
+
+**Why this matters for attacks:**
+- **Pass-the-Hash:** If you capture an NT hash, you can authenticate as that user without knowing their plaintext password
+- **NTLM Relay:** If you can intercept an NTLM authentication attempt, you can relay it to another service to authenticate as that user
+- **Hash Capture:** Tools like Responder poison LLMNR/NBT-NS requests to capture NTLMv2 hashes for offline cracking
+
+---
+
+## Domain Trusts
+
+Trust relationships allow users in one domain to access resources in another.
+
+| Trust Type | Direction | Description |
+|------------|-----------|-------------|
+| One-way trust | → | Domain A trusts Domain B (B can access A's resources) |
+| Two-way trust | ↔ | Both domains trust each other |
+| Transitive trust | A↔B, B↔C → A↔C | Trust flows through the chain |
+| Forest trust | Forest-level | Explicit trust between separate forests |
+
+**Attacker relevance:** In a multi-domain forest, compromising a child domain often leads to forest root compromise via the `SID History` attribute or the `Enterprise Admins` group. Cross-domain and cross-forest attacks are advanced OSCP territory but appear in challenge labs.
+
+---
+
+## Enumeration Commands Reference
+
+Commands used throughout Phase 5 when working inside an AD environment:
+
+```powershell
+# Domain information
+Get-ADDomain
+[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+
+# User enumeration
+Get-ADUser -Filter * -Properties *
+net user /domain
+
+# Group enumeration  
+Get-ADGroup -Filter * | Select Name
+net group /domain
+net group "Domain Admins" /domain
+
+# Computer enumeration
+Get-ADComputer -Filter * | Select Name
+net view /domain
+
+# SPN enumeration (Kerberoasting targets)
+Get-ADUser -Filter {ServicePrincipalName -ne "$null"} -Properties ServicePrincipalName
+
+# Check for AS-REP Roasting candidates
+Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} -Properties DoesNotRequirePreAuth
+```
+
+From Linux (unauthenticated or with credentials):
+
+```bash
+# Enumerate with enum4linux
+enum4linux -a <dc-ip>
+
+# LDAP enumeration
+ldapsearch -x -H ldap://<dc-ip> -b "dc=corp,dc=local"
+
+# BloodHound collection (most comprehensive)
+bloodhound-python -u <user> -p <password> -d <domain> -dc <dc-ip> -c All
+```
+
+---
+
+## Key Takeaways
+
+**The OSCP AD set is 40 points.** It's structured as a network of multiple machines where you need to chain compromises — initial access on a workstation, lateral movement to a server, privilege escalation to Domain Admin. Missing AD means needing a near-perfect score on standalone machines.
+
+**BloodHound is indispensable.** It maps every AD relationship and computes attack paths automatically. The concepts in this room are what BloodHound is visualizing — you need to understand the underlying structure to interpret BloodHound's output correctly.
+
+**Service accounts are the attack surface.** They have SPNs (Kerberoasting targets), often have weak passwords, often have elevated privileges, and often haven't been rotated in years.
+
+---
+
+## References
+
+- [Microsoft AD DS Overview](https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/virtual-dc/active-directory-domain-services-overview)
+- [Kerberos Authentication Explained](https://web.mit.edu/kerberos/whatis.html)
+- [adsecurity.org — AD Attack Reference](https://adsecurity.org/)
+- [BloodHound Documentation](https://bloodhound.readthedocs.io/)
+
+---
+
